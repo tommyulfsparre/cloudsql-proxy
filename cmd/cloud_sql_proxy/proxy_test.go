@@ -16,9 +16,13 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"testing"
+
+	"golang.org/x/net/context"
 )
 
 type mockTripper struct {
@@ -149,5 +153,49 @@ func TestParseInstanceConfig(t *testing.T) {
 		if got != v.wantCfg {
 			t.Errorf("parseInstanceConfig(%s, %s) = %+v, want %+v", v.dir, v.instance, got, v.wantCfg)
 		}
+	}
+}
+
+// dialUntilErr tries to connect to a unix socket until
+// it returns an error.
+func dialUntilErr(socket string) {
+	for {
+		_, err := net.Dial("unix", socket)
+		if err != nil {
+			return
+		}
+	}
+}
+
+func TestCloseOnCancelContext(t *testing.T) {
+	socket := "TestContext.sock"
+	ctx, cancel := context.WithCancel(context.Background())
+	cfgs := []instanceConfig{
+		instanceConfig{
+			Instance: "testInstance",
+			Network:  "unix",
+			Address:  socket,
+		},
+	}
+	ch, err := WatchInstances(ctx, ".", cfgs, make(<-chan string), mockClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	preConn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	<-ch
+	cancel()
+	// There is a window after the context has been canceled and until
+	// all listener has been closed where new connections will still be accepted.
+	dialUntilErr(socket)
+
+	// Should be able to write on existing connection.
+	_, err = fmt.Fprint(preConn, "PING")
+	if err != nil {
+		t.Fatal(err)
 	}
 }

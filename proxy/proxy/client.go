@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"golang.org/x/net/context"
 )
 
 const (
@@ -32,10 +33,16 @@ const (
 	keepAlivePeriod           = time.Minute
 )
 
-// errNotCached is returned when the instance was not found in the Client's
-// cache. It is an internal detail and is not actually ever returned to the
-// user.
-var errNotCached = errors.New("instance was not found in cache")
+var (
+	// errNotCached is returned when the instance was not found in the Client's
+	// cache. It is an internal detail and is not actually ever returned to the
+	// user.
+	errNotCached = errors.New("instance was not found in cache")
+
+	// shutdownPollInterval is how often we poll for a clients connections to reach
+	// zero when shutting down.
+	shutdownPollInterval = 500 * time.Millisecond
+)
 
 // Conn represents a connection from a client to a specific instance.
 type Conn struct {
@@ -87,7 +94,11 @@ type Client struct {
 	MaxConnections uint64
 
 	// ConnectionsCounter is used to enforce the optional maxConnections limit
+	// and to support graceful shutdown.
 	ConnectionsCounter uint64
+
+	// inShutdown set to a non-zero value means this client is shutting down.
+	inShutdown int32
 }
 
 type cacheEntry struct {
@@ -104,20 +115,45 @@ func (c *Client) Run(connSrc <-chan Conn) {
 	for conn := range connSrc {
 		go c.handleConn(conn)
 	}
+}
 
-	if err := c.Conns.Close(); err != nil {
-		logging.Errorf("closing client had error: %v", err)
+// Shutdown tries to gracefully shut down this client by blocking until the
+// tracked connection count reaches zero.
+// If the supplied context is canceled all current connection will be closed
+// and an error returned to the caller.
+// This function can only be called once.
+func (c *Client) Shutdown(ctx context.Context) error {
+	if !atomic.CompareAndSwapInt32(&c.inShutdown, 0, 1) {
+		return errors.New("shutdown already in progress")
+	}
+
+	ticker := time.NewTicker(shutdownPollInterval)
+	defer ticker.Stop()
+
+	for {
+		if atomic.LoadUint64(&c.ConnectionsCounter) == uint64(0) {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			if err := c.Conns.Close(); err != nil {
+				logging.Errorf("closing client had error: %v", err)
+			}
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
 func (c *Client) handleConn(conn Conn) {
-	// Track connections count only if a maximum connections limit is set to avoid useless overhead
+	// Connection tracking for enforcing maximum connection limits and/or
+	// graceful shutdown.
+	active := atomic.AddUint64(&c.ConnectionsCounter, 1)
+	// Deferred decrement of ConnectionsCounter upon connection closing.
+	defer atomic.AddUint64(&c.ConnectionsCounter, ^uint64(0))
+
 	if c.MaxConnections > 0 {
-		active := atomic.AddUint64(&c.ConnectionsCounter, 1)
-
-		// Deferred decrement of ConnectionsCounter upon connection closing
-		defer atomic.AddUint64(&c.ConnectionsCounter, ^uint64(0))
-
 		if active > c.MaxConnections {
 			logging.Errorf("too many open connections (max %d)", c.MaxConnections)
 			conn.Conn.Close()

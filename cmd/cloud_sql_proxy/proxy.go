@@ -31,6 +31,7 @@ import (
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/fuse"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
+	"golang.org/x/net/context"
 	sqladmin "google.golang.org/api/sqladmin/v1beta4"
 )
 
@@ -38,7 +39,7 @@ import (
 // local connections.  Values received from the updates channel are
 // interpretted as a comma-separated list of instances.  The set of sockets in
 // 'dir' is the union of 'instances' and the most recent list from 'updates'.
-func WatchInstances(dir string, cfgs []instanceConfig, updates <-chan string, cl *http.Client) (<-chan proxy.Conn, error) {
+func WatchInstances(ctx context.Context, dir string, cfgs []instanceConfig, updates <-chan string, cl *http.Client) (<-chan proxy.Conn, error) {
 	ch := make(chan proxy.Conn, 1)
 
 	// Instances specified statically (e.g. as flags to the binary) will always
@@ -53,54 +54,64 @@ func WatchInstances(dir string, cfgs []instanceConfig, updates <-chan string, cl
 		staticInstances[v.Instance] = l
 	}
 
-	if updates != nil {
-		go watchInstancesLoop(dir, ch, updates, staticInstances, cl)
-	}
+	go watchInstancesLoop(ctx, dir, ch, updates, staticInstances, cl)
 	return ch, nil
 }
 
-func watchInstancesLoop(dir string, dst chan<- proxy.Conn, updates <-chan string, static map[string]net.Listener, cl *http.Client) {
+func watchInstancesLoop(ctx context.Context, dir string, dst chan<- proxy.Conn, updates <-chan string, static map[string]net.Listener, cl *http.Client) {
 	dynamicInstances := make(map[string]net.Listener)
-	for instances := range updates {
-		list, err := parseInstanceConfigs(dir, strings.Split(instances, ","), cl)
-		if err != nil {
-			logging.Errorf("%v", err)
-		}
-
-		stillOpen := make(map[string]net.Listener)
-		for _, cfg := range list {
-			instance := cfg.Instance
-
-			// If the instance is specified in the static list don't do anything:
-			// it's already open and should stay open forever.
-			if _, ok := static[instance]; ok {
-				continue
-			}
-
-			if l, ok := dynamicInstances[instance]; ok {
-				delete(dynamicInstances, instance)
-				stillOpen[instance] = l
-				continue
-			}
-
-			l, err := listenInstance(dst, cfg)
-			if err != nil {
-				logging.Errorf("Couldn't open socket for %q: %v", instance, err)
-				continue
-			}
-			stillOpen[instance] = l
-		}
-
-		// Any instance in dynamicInstances was not in the most recent metadata
-		// update. Clean up those instances' sockets by closing them; note that
-		// this does not affect any existing connections instance.
-		for instance, listener := range dynamicInstances {
-			logging.Infof("Closing socket for instance %v", instance)
-			listener.Close()
-		}
-
-		dynamicInstances = stillOpen
+	if updates == nil {
+		updates = make(<-chan string)
 	}
+UpdateLoop:
+	for {
+		select {
+		case instances := <-updates:
+			list, err := parseInstanceConfigs(dir, strings.Split(instances, ","), cl)
+			if err != nil {
+				logging.Errorf("%v", err)
+			}
+
+			stillOpen := make(map[string]net.Listener)
+			for _, cfg := range list {
+				instance := cfg.Instance
+
+				// If the instance is specified in the static list don't do anything:
+				// it's already open and should stay open forever.
+				if _, ok := static[instance]; ok {
+					continue
+				}
+
+				if l, ok := dynamicInstances[instance]; ok {
+					delete(dynamicInstances, instance)
+					stillOpen[instance] = l
+					continue
+				}
+
+				l, err := listenInstance(dst, cfg)
+				if err != nil {
+					logging.Errorf("Couldn't open socket for %q: %v", instance, err)
+					continue
+				}
+				stillOpen[instance] = l
+			}
+
+			// Any instance in dynamicInstances was not in the most recent metadata
+			// update. Clean up those instances' sockets by closing them; note that
+			// this does not affect any existing connections instance.
+			for instance, listener := range dynamicInstances {
+				logging.Infof("Closing socket for instance %v", instance)
+				listener.Close()
+			}
+
+			dynamicInstances = stillOpen
+		case <-ctx.Done():
+			logging.Infof("Stop watching for updates")
+			break UpdateLoop
+		}
+	}
+
+	logging.Infof("Closing listener")
 
 	for _, v := range static {
 		if err := v.Close(); err != nil {

@@ -30,9 +30,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
@@ -55,6 +57,8 @@ var (
 	refreshCfgThrottle = flag.Duration("refresh_config_throttle", proxy.DefaultRefreshCfgThrottle, "If set, this flag specifies the amount of forced sleep between successive API calls in order to protect client API quota. Minimum allowed value is "+minimumRefreshCfgThrottle.String())
 	checkRegion        = flag.Bool("check_region", false, `If specified, the 'region' portion of the connection string is required for
 Unix socket-based connections.`)
+
+	shutdownGracePeriod = flag.Duration("shutdown_grace_period", 30*time.Second, "Max time to wait for connections to drain before shutting down. Default 30s.")
 
 	// Settings for how to choose which instance to connect to.
 	dir      = flag.String("dir", "", "Directory to use for placing Unix sockets representing database instances")
@@ -421,6 +425,10 @@ func main() {
 	// it is not efficient to do so.
 	var connset *proxy.ConnSet
 
+	// Create new context used for signaling that all connection
+	// listener should close.
+	connCtx, cancel := context.WithCancel(ctx)
+
 	// Initialize a source of new connections to Cloud SQL instances.
 	var connSrc <-chan proxy.Conn
 	if *useFuse {
@@ -430,7 +438,10 @@ func main() {
 			log.Fatalf("Could not start fuse directory at %q: %v", *dir, err)
 		}
 		connSrc = c
-		defer fuse.Close()
+		go func() {
+			<-connCtx.Done()
+			fuse.Close()
+		}()
 	} else {
 		updates := make(chan string)
 		if *instanceSrc != "" {
@@ -450,7 +461,7 @@ func main() {
 			}()
 		}
 
-		c, err := WatchInstances(*dir, cfgs, updates, client)
+		c, err := WatchInstances(connCtx, *dir, cfgs, updates, client)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -461,9 +472,10 @@ func main() {
 	if refreshCfgThrottle < minimumRefreshCfgThrottle {
 		refreshCfgThrottle = minimumRefreshCfgThrottle
 	}
+
 	logging.Infof("Ready for new connections")
 
-	(&proxy.Client{
+	pc := &proxy.Client{
 		Port:           port,
 		MaxConnections: *maxConnections,
 		Certs: certs.NewCertSourceOpts(client, certs.RemoteOpts{
@@ -473,5 +485,27 @@ func main() {
 		}),
 		Conns:              connset,
 		RefreshCfgThrottle: refreshCfgThrottle,
-	}).Run(connSrc)
+	}
+
+	go func(connSrc <-chan proxy.Conn) {
+		pc.Run(connSrc)
+	}(connSrc)
+
+	// Wire up signal handler.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+
+	// Block on Signal channel.
+	logging.Infof("Signal %v received, shutting down Cloud SQL Proxy after %v...", <-sigc, *shutdownGracePeriod)
+
+	// Cancel context will stop instance discovery updates and close all listerner or
+	// shutdown the FUSE server if configured.
+	cancel()
+
+	// Start graceful shutdown.
+	drainCtx, _ := context.WithTimeout(ctx, *shutdownGracePeriod)
+	if err := pc.Shutdown(drainCtx); err != nil {
+		logging.Errorf("Error shutting down: %v", err)
+	}
+	os.Exit(0)
 }

@@ -24,6 +24,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 const instance = "instance-name"
@@ -181,5 +183,71 @@ func TestMaximumConnectionsCount(t *testing.T) {
 		t.Logf("client has correctly refused to dial new connection on %dth attempt when the maximum of %d connections was reached (%d dials)\n", numConnections, maxConnections, dials)
 	case dials < maxConnections:
 		t.Errorf("client should have dialed exactly the maximum of %d connections (%d connections, %d dials)", maxConnections, numConnections, dials)
+	}
+}
+
+func TestProxyClientShutdown(t *testing.T) {
+	// Change the default shutdown polling interval for this test.
+	shutdownPollInterval = 10 * time.Millisecond
+	// Max time to wait for shutdown in this test.
+	shutdownGracePeriod := time.Second
+
+	tests := []struct {
+		name          string
+		client        *Client
+		expectedError bool
+	}{
+
+		{
+			name:          "Should shutdown after client connections drops to zero.",
+			client:        &Client{},
+			expectedError: false,
+		},
+		{
+			name:          "Should return error on canceled context.",
+			client:        &Client{},
+			expectedError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			go func() {
+				ch := make(chan Conn, 0)
+				test.client.Run(ch)
+			}()
+
+			// Increment connection count by one.
+			// TODO: Exercice the real client connection tracking instead of
+			// faking it here.
+			atomic.AddUint64(&test.client.ConnectionsCounter, 1)
+
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
+
+			done := make(chan struct{}, 0)
+			go func(ctx context.Context) {
+				err := test.client.Shutdown(ctx)
+				if err != nil && !test.expectedError {
+					t.Fatal(err)
+				}
+				if err == nil && test.expectedError {
+					t.Fatalf("Expected shutdown to return an error.")
+				}
+				close(done)
+			}(ctx)
+
+			if test.expectedError {
+				cancel()
+			} else {
+				// Decrement connection count by one.
+				atomic.AddUint64(&test.client.ConnectionsCounter, ^uint64(0))
+			}
+
+			select {
+			case <-done:
+			case <-time.After(shutdownGracePeriod):
+				t.Errorf("Proxy did not shutdown within the %v grace period", shutdownGracePeriod)
+			}
+		})
 	}
 }
