@@ -66,7 +66,10 @@ func watchInstancesLoop(ctx context.Context, dir string, dst chan<- proxy.Conn, 
 UpdateLoop:
 	for {
 		select {
-		case instances := <-updates:
+		case instances, open := <-updates:
+			if !open {
+				break UpdateLoop
+			}
 			list, err := parseInstanceConfigs(dir, strings.Split(instances, ","), cl)
 			if err != nil {
 				logging.Errorf("%v", err)
