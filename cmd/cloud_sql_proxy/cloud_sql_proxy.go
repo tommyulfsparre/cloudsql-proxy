@@ -404,7 +404,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
 	client, err := authenticatedClient(ctx)
 	if err != nil {
 		log.Fatal(err)
@@ -425,10 +425,6 @@ func main() {
 	// it is not efficient to do so.
 	var connset *proxy.ConnSet
 
-	// Create new context used for signaling that all connection
-	// listener should close.
-	connCtx, cancel := context.WithCancel(ctx)
-
 	// Initialize a source of new connections to Cloud SQL instances.
 	var connSrc <-chan proxy.Conn
 	if *useFuse {
@@ -439,7 +435,7 @@ func main() {
 		}
 		connSrc = c
 		go func() {
-			<-connCtx.Done()
+			<-ctx.Done()
 			fuse.Close()
 		}()
 	} else {
@@ -461,7 +457,7 @@ func main() {
 			}()
 		}
 
-		c, err := WatchInstances(connCtx, *dir, cfgs, updates, client)
+		c, err := WatchInstances(ctx, *dir, cfgs, updates, client)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -487,24 +483,22 @@ func main() {
 		RefreshCfgThrottle: refreshCfgThrottle,
 	}
 
-	go func(connSrc <-chan proxy.Conn) {
-		pc.Run(connSrc)
-	}(connSrc)
+	go pc.Run(connSrc)
 
-	// Wire up signal handler.
+	// Wire up our signal handler.
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 
 	// Block on Signal channel.
-	logging.Infof("Signal %v received, shutting down Cloud SQL Proxy after %v...", <-sigc, *shutdownGracePeriod)
+	logging.Infof("Signal: %v received, shutting down Cloud SQL Proxy with a %v grace period...", <-sigc, *shutdownGracePeriod)
 
 	// Cancel context will stop instance discovery updates and close all listerner or
 	// shutdown the FUSE server if configured.
 	cancel()
 
 	// Start graceful shutdown.
-	drainCtx, _ := context.WithTimeout(ctx, *shutdownGracePeriod)
-	if err := pc.Shutdown(drainCtx); err != nil {
+	ctx, _ = context.WithTimeout(context.Background(), *shutdownGracePeriod)
+	if err := pc.Shutdown(ctx); err != nil {
 		logging.Errorf("Error shutting down: %v", err)
 	}
 	os.Exit(0)
