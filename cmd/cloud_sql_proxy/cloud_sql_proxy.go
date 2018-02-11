@@ -485,16 +485,7 @@ func main() {
 
 	go pc.Run(connSrc)
 
-	// Wire up our signal handler.
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
-
-	// Block on Signal channel.
-	logging.Infof("Signal: %v received, shutting down Cloud SQL Proxy with a %v grace period...", <-sigc, *shutdownGracePeriod)
-
-	// Cancel context will stop instance discovery updates and close all listerner or
-	// shutdown the FUSE server if configured.
-	cancel()
+	interrupt(cancel)
 
 	// Start graceful shutdown.
 	ctx, _ = context.WithTimeout(context.Background(), *shutdownGracePeriod)
@@ -502,4 +493,15 @@ func main() {
 		logging.Errorf("Error shutting down: %v", err)
 	}
 	os.Exit(0)
+}
+
+func interrupt(cancel context.CancelFunc) {
+	defer cancel()
+
+	// Wire up our signal handler.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+
+	// Block on Signal channel.
+	logging.Infof("Signal: %v received, shutting down Cloud SQL Proxy with a %v grace period...", <-sigc, *shutdownGracePeriod)
 }
