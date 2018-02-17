@@ -36,11 +36,12 @@ import (
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
 
+	"strings"
+
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
 	compute "google.golang.org/api/compute/v1"
-	"strings"
 )
 
 var (
@@ -82,11 +83,11 @@ func setupGCEProxy(t *testing.T, proxyArgs []string) (error, *ssh.Client) {
 	log.Printf("apt-get update...")
 	var sout, serr bytes.Buffer
 	if err := sshRun(ssh, "sudo apt-get update", nil, &sout, &serr); err != nil {
-		t.Fatal("Failed 'sudo apt-get update' on remote machine: %v\n\nstandard out:\n%s\nstandard err:\n%s", err, &sout, &serr)
+		t.Fatalf("Failed 'sudo apt-get update' on remote machine: %v\n\nstandard out:\n%s\nstandard err:\n%s", err, &sout, &serr)
 	}
 	log.Printf("Install mysql client...")
 	if err := sshRun(ssh, "sudo apt-get install -y mysql-client", nil, &sout, &serr); err != nil {
-		t.Fatal("Failed 'sudo apt-get install -y mysql-client' on remote machine: %v\n\nstandard out:\n%s\nstandard err:\n%s", err, &sout, &serr)
+		t.Fatalf("Failed 'sudo apt-get install -y mysql-client' on remote machine: %v\n\nstandard out:\n%s\nstandard err:\n%s", err, &sout, &serr)
 	}
 	if err = sshRun(ssh, "pkill cloud_sql_proxy", nil, &sout, &serr); err != nil {
 		t.Logf("Failed to kill any cloud_sql_proxy process.")
