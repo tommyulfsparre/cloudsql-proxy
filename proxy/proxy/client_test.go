@@ -214,7 +214,7 @@ func TestProxyClientShutdown(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			go func() {
 				ch := make(chan Conn, 0)
-				test.client.Run(ch)
+				test.client.Run(context.Background(), ch)
 			}()
 
 			// Increment connection count by one.
@@ -249,5 +249,26 @@ func TestProxyClientShutdown(t *testing.T) {
 				t.Errorf("Proxy did not shutdown within the %v grace period", shutdownGracePeriod)
 			}
 		})
+	}
+}
+
+func TestProxyClientRunContextCancel(t *testing.T) {
+	client := &Client{}
+	ch := make(chan Conn, 0)
+	done := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func(ctx context.Context) {
+		client.Run(ctx, ch)
+		close(done)
+	}(ctx)
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Error("Client did not stop when context was canceled")
 	}
 }

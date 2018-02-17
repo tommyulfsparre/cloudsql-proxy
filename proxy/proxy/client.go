@@ -110,10 +110,19 @@ type cacheEntry struct {
 }
 
 // Run causes the client to start waiting for new connections to connSrc and
-// proxy them to the destination instance. It blocks until connSrc is closed.
-func (c *Client) Run(connSrc <-chan Conn) {
-	for conn := range connSrc {
-		go c.handleConn(conn)
+// proxy them to the destination instance. It blocks until connSrc is closed or
+// the supplied Context is canceled.
+func (c *Client) Run(ctx context.Context, connSrc <-chan Conn) {
+	for {
+		select {
+		case conn, open := <-connSrc:
+			if !open {
+				return
+			}
+			go c.handleConn(conn)
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

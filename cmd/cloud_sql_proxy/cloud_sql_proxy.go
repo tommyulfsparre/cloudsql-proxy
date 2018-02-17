@@ -404,7 +404,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := interruptWithContext(context.Background())
 	client, err := authenticatedClient(ctx)
 	if err != nil {
 		log.Fatal(err)
@@ -483,9 +483,7 @@ func main() {
 		RefreshCfgThrottle: refreshCfgThrottle,
 	}
 
-	go pc.Run(connSrc)
-
-	interrupt(cancel)
+	pc.Run(ctx, connSrc)
 
 	// Start graceful shutdown.
 	ctx, _ = context.WithTimeout(context.Background(), *shutdownGracePeriod)
@@ -495,13 +493,23 @@ func main() {
 	os.Exit(0)
 }
 
-func interrupt(cancel context.CancelFunc) {
-	defer cancel()
+// interruptWithContext will cancel the returned context when
+// either the signal SIGINT or SIGTERM is sent to the proxy process.
+func interruptWithContext(ctx context.Context) context.Context {
+	ctx, cancel := context.WithCancel(ctx)
 
 	// Wire up our signal handler.
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 
-	// Block on Signal channel.
-	logging.Infof("Signal: %v received, shutting down Cloud SQL Proxy with a %v grace period...", <-sigc, *shutdownGracePeriod)
+	go func() {
+		select {
+		case sig := <-sigc:
+			logging.Infof("Signal: %v received, shutting down Cloud SQL Proxy with a %v grace period...", sig, *shutdownGracePeriod)
+		case <-ctx.Done():
+		}
+		cancel()
+	}()
+
+	return ctx
 }
